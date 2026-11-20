@@ -33,9 +33,83 @@ math drifts at NTSC rates and is not acceptable.
 
 from __future__ import annotations
 
+from fractions import Fraction
+
 
 class SpliceError(Exception):
     """Raised when a splice request is invalid or cannot be completed atomically."""
+
+
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _round_div(a: int, b: int) -> int:
+    """Round ``a / b`` to the nearest integer, halves rounding up.
+
+    Uses integer arithmetic only; ``b`` must be positive.
+    """
+    q, r = divmod(a, b)
+    if 2 * r >= b:
+        q += 1
+    return q
+
+
+def _parse_timebase(timebase: int | tuple[int, int]) -> tuple[int, int]:
+    """Normalise a frames/second timebase to a positive ``(num, den)`` pair."""
+    if _is_int(timebase):
+        num, den = timebase, 1
+    elif (
+        isinstance(timebase, (tuple, list))
+        and len(timebase) == 2
+        and _is_int(timebase[0])
+        and _is_int(timebase[1])
+    ):
+        num, den = timebase
+    else:
+        raise SpliceError(f"invalid timebase: {timebase!r}")
+    if num <= 0 or den <= 0:
+        raise SpliceError(f"non-positive timebase: {timebase!r}")
+    return num, den
+
+
+def _frame_ms(segment: dict) -> Fraction:
+    """Exact frame duration in milliseconds derived from keyframe spacing."""
+    keyframes = segment["keyframes"]
+    return Fraction(
+        keyframes[-1] - keyframes[0],
+        (len(keyframes) - 1) * segment["gop"],
+    )
+
+
+def _check_segment_geometry(segment: dict) -> None:
+    in_pts = segment.get("in")
+    out_pts = segment.get("out")
+    gop = segment.get("gop")
+    keyframes = segment.get("keyframes")
+    if not _is_int(in_pts) or not _is_int(out_pts):
+        raise SpliceError("segment has missing or non-int in/out")
+    if out_pts <= in_pts:
+        raise SpliceError(f"segment has out <= in ({in_pts}, {out_pts})")
+    if not _is_int(gop) or gop <= 0:
+        raise SpliceError(f"segment has invalid gop: {gop!r}")
+    if (
+        not isinstance(keyframes, list)
+        or not keyframes
+        or any(not _is_int(k) for k in keyframes)
+    ):
+        raise SpliceError("segment has a missing or invalid keyframes list")
+    if any(keyframes[i] >= keyframes[i + 1] for i in range(len(keyframes) - 1)):
+        raise SpliceError("segment keyframes are not sorted")
+
+
+def _nearest_keyframe(keyframes: list[int], pts: int) -> int:
+    """Nearest keyframe to ``pts``; ties go to the earlier keyframe."""
+    best = keyframes[0]
+    for kf in keyframes[1:]:
+        if abs(kf - pts) < abs(best - pts):
+            best = kf
+    return best
 
 
 def align_to_gop(segments: list[dict]) -> list[dict]:
@@ -55,7 +129,28 @@ def align_to_gop(segments: list[dict]) -> list[dict]:
     Invalid geometry (``out <= in``, ``gop <= 0``, or a missing/unsorted
     ``keyframes`` list) raises :class:`SpliceError`.
     """
-    raise NotImplementedError
+    aligned = []
+    for segment in segments:
+        _check_segment_geometry(segment)
+        keyframes = segment["keyframes"]
+        if len(keyframes) >= 2:
+            gop_ms = _frame_ms(segment) * segment["gop"]
+        else:
+            gop_ms = None  # spacing unknown: no distance limit
+
+        new_in = segment["in"]
+        nearest = _nearest_keyframe(keyframes, segment["in"])
+        if gop_ms is None or abs(nearest - segment["in"]) <= gop_ms:
+            new_in = nearest
+
+        new_out = segment["out"]
+        nearest = _nearest_keyframe(keyframes, segment["out"])
+        if gop_ms is None or abs(nearest - segment["out"]) <= gop_ms:
+            if nearest > new_in:
+                new_out = nearest
+
+        aligned.append({**segment, "in": new_in, "out": new_out})
+    return aligned
 
 
 def concat_pts(segments: list[dict], timebase: int | tuple[int, int]) -> list[int]:
@@ -78,7 +173,20 @@ def concat_pts(segments: list[dict], timebase: int | tuple[int, int]) -> list[in
     pair; PTS values are milliseconds. A non-positive timebase or a segment
     with ``out <= in`` raises :class:`SpliceError`.
     """
-    raise NotImplementedError
+    num, den = _parse_timebase(timebase)
+    result = []
+    cumulative_ms = 0
+    for segment in segments:
+        in_pts = segment.get("in")
+        out_pts = segment.get("out")
+        if not _is_int(in_pts) or not _is_int(out_pts) or out_pts <= in_pts:
+            raise SpliceError(
+                f"segment has invalid in/out: {in_pts!r}, {out_pts!r}"
+            )
+        cumulative_ms += out_pts - in_pts
+        frames = _round_div(cumulative_ms * num, den * 1000)
+        result.append(_round_div(frames * den * 1000, num))
+    return result
 
 
 def retime_audio(segments: list[dict], audio_rate: int) -> list[int]:
@@ -98,7 +206,17 @@ def retime_audio(segments: list[dict], audio_rate: int) -> list[int]:
     Empty input returns ``[]`` and a non-positive ``audio_rate`` raises
     :class:`SpliceError`. Durations and PTS values are in milliseconds.
     """
-    raise NotImplementedError
+    if not _is_int(audio_rate) or audio_rate <= 0:
+        raise SpliceError(f"non-positive audio rate: {audio_rate!r}")
+    counts = []
+    cumulative_ms = 0
+    previous_end = 0
+    for segment in segments:
+        cumulative_ms += segment["out"] - segment["in"]
+        end = _round_div(cumulative_ms * audio_rate, 1000)
+        counts.append(end - previous_end)
+        previous_end = end
+    return counts
 
 
 def detect_gaps(
@@ -121,7 +239,24 @@ def detect_gaps(
     :class:`SpliceError` before any segment is inspected. Empty input returns
     ``[]``.
     """
-    raise NotImplementedError
+    if not _is_int(max_gap_ms) or max_gap_ms < 0:
+        raise SpliceError(f"negative max_gap_ms: {max_gap_ms!r}")
+    valid = [
+        s
+        for s in segments
+        if _is_int(s.get("in"))
+        and _is_int(s.get("out"))
+        and s["in"] >= 0
+        and s["out"] >= 0
+        and s["out"] > s["in"]
+    ]
+    valid.sort(key=lambda s: s["in"])
+    gaps = []
+    for prev, nxt in zip(valid, valid[1:]):
+        gap = nxt["in"] - prev["out"]
+        if gap > max_gap_ms:
+            gaps.append((prev["out"], nxt["in"], gap))
+    return gaps
 
 
 def insert_transition(segments: list[dict], index: int, duration_ms: int) -> list[dict]:
@@ -146,7 +281,36 @@ def insert_transition(segments: list[dict], index: int, duration_ms: int) -> lis
     An invalid index, non-positive duration, non-touching boundary, or clip too
     short to give up its half raises :class:`SpliceError`.
     """
-    raise NotImplementedError
+    if not _is_int(index) or not 0 <= index < len(segments) - 1:
+        raise SpliceError(f"invalid transition index: {index!r}")
+    if not _is_int(duration_ms) or duration_ms <= 0:
+        raise SpliceError(f"non-positive transition duration: {duration_ms!r}")
+    left = segments[index]
+    right = segments[index + 1]
+    if left["out"] != right["in"]:
+        raise SpliceError(
+            f"segments do not touch: {left['out']} != {right['in']}"
+        )
+    left_half = duration_ms // 2
+    right_half = duration_ms - left_half
+    if left["out"] - left["in"] <= left_half:
+        raise SpliceError("left clip too short to give up its half")
+    if right["out"] - right["in"] <= right_half:
+        raise SpliceError("right clip too short to give up its half")
+
+    new_left = {**left, "out": left["out"] - left_half}
+    new_right = {**right, "in": right["in"] + right_half}
+    transition = {
+        "kind": "transition",
+        "in": new_left["out"],
+        "out": new_right["in"],
+        "duration_ms": duration_ms,
+    }
+    return (
+        list(segments[:index])
+        + [new_left, transition, new_right]
+        + list(segments[index + 2 :])
+    )
 
 
 def split_at(segment: dict, pts: int) -> tuple[dict, dict]:
@@ -164,7 +328,47 @@ def split_at(segment: dict, pts: int) -> tuple[dict, dict]:
     ``in < pts < out``, at least two keyframes, and ``gop > 0``; otherwise it
     raises :class:`SpliceError`.
     """
-    raise NotImplementedError
+    in_pts = segment.get("in")
+    out_pts = segment.get("out")
+    gop = segment.get("gop")
+    keyframes = segment.get("keyframes")
+    if not _is_int(in_pts) or not _is_int(out_pts) or not in_pts < pts < out_pts:
+        raise SpliceError(f"split point {pts!r} not inside segment")
+    if not isinstance(keyframes, list) or len(keyframes) < 2:
+        raise SpliceError("split requires at least two keyframes")
+    if not _is_int(gop) or gop <= 0:
+        raise SpliceError(f"invalid gop: {gop!r}")
+
+    frame_ms = Fraction(
+        keyframes[-1] - keyframes[0], (len(keyframes) - 1) * gop
+    )
+    if frame_ms <= 0:
+        raise SpliceError("non-positive frame duration from keyframes")
+
+    # Nearest frame index, ties going to the later frame (round half up).
+    offset = Fraction(pts - keyframes[0]) / frame_ms
+    frame_index = (2 * offset.numerator + offset.denominator) // (
+        2 * offset.denominator
+    )
+    cut_fraction = keyframes[0] + frame_index * frame_ms
+    cut = (2 * cut_fraction.numerator + cut_fraction.denominator) // (
+        2 * cut_fraction.denominator
+    )
+    # Clamp so both halves stay non-empty.
+    cut = max(cut, in_pts + 1)
+    cut = min(cut, out_pts - 1)
+
+    left = {
+        **segment,
+        "out": cut,
+        "keyframes": [k for k in keyframes if k < cut],
+    }
+    right = {
+        **segment,
+        "in": cut,
+        "keyframes": [k for k in keyframes if k >= cut],
+    }
+    return left, right
 
 
 def validate(segments: list[dict]) -> list[str]:
@@ -188,7 +392,55 @@ def validate(segments: list[dict]) -> list[str]:
     ``"out of order"``, or ``"overlap"``. PTS values are milliseconds and the
     list is empty for empty input.
     """
-    raise NotImplementedError
+    issues = []
+    prev_in = prev_out = None
+    for i, segment in enumerate(segments):
+        prefix = f"segment {i}: "
+        if not isinstance(segment, dict):
+            issues.append(prefix + "not a segment dict")
+            continue
+        in_pts = segment.get("in")
+        out_pts = segment.get("out")
+        gop = segment.get("gop")
+        keyframes = segment.get("keyframes")
+
+        pts_ok = _is_int(in_pts) and _is_int(out_pts)
+        if not pts_ok:
+            issues.append(prefix + "missing or non-int in/out")
+
+        if not _is_int(gop) or gop <= 0:
+            issues.append(prefix + "invalid gop")
+
+        kf_ok = isinstance(keyframes, list) and all(
+            _is_int(k) for k in keyframes
+        )
+        if not kf_ok:
+            issues.append(prefix + "missing or non-int keyframes")
+
+        if pts_ok:
+            if in_pts < 0 or out_pts < 0:
+                issues.append(prefix + "negative pts")
+            if out_pts == in_pts:
+                issues.append(prefix + "zero duration")
+            elif out_pts < in_pts:
+                issues.append(prefix + "negative duration")
+
+        if kf_ok:
+            if any(
+                keyframes[j] >= keyframes[j + 1]
+                for j in range(len(keyframes) - 1)
+            ):
+                issues.append(prefix + "keyframes not sorted")
+            if pts_ok and any(k < in_pts or k > out_pts for k in keyframes):
+                issues.append(prefix + "keyframe out of range")
+
+        if pts_ok:
+            if prev_in is not None and in_pts < prev_in:
+                issues.append(prefix + "out of order")
+            if prev_out is not None and in_pts < prev_out:
+                issues.append(prefix + "overlap")
+            prev_in, prev_out = in_pts, out_pts
+    return issues
 
 
 def splice_batch(
@@ -216,4 +468,29 @@ def splice_batch(
     ``timebase`` uses the same frames/second form as :func:`concat_pts`; PTS is
     in milliseconds and the 1 ms tolerance applies.
     """
-    raise NotImplementedError
+    results = []
+    try:
+        for job in jobs:
+            segments = job["segments"]
+            problems = validate(segments)
+            if problems:
+                return {
+                    "ok": False,
+                    "jobs": [],
+                    "error": (
+                        f"job {job.get('name')!r}: " + "; ".join(problems)
+                    ),
+                }
+            aligned = align_to_gop(segments)
+            pts = concat_pts(aligned, timebase)
+            results.append(
+                {
+                    "name": job["name"],
+                    "segments": aligned,
+                    "pts": pts,
+                    "duration_ms": pts[-1] if pts else 0,
+                }
+            )
+    except SpliceError as exc:
+        return {"ok": False, "jobs": [], "error": str(exc)}
+    return {"ok": True, "jobs": results, "error": None}
